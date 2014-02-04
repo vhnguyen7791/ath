@@ -46,6 +46,18 @@
 
 #define ATH10K_MAX_NUM_MGMT_PENDING 128
 
+/* number of failed packets */
+#define ATH10K_KICKOUT_THRESHOLD 50
+
+/*
+ * Use insanely high numbers to make sure that the firmware implementation
+ * won't start, we have the same functionality already in hostapd. Unit
+ * is seconds.
+ */
+#define ATH10K_KEEPALIVE_MIN_IDLE 3747
+#define ATH10K_KEEPALIVE_MAX_IDLE 3895
+#define ATH10K_KEEPALIVE_MAX_UNRESPONSIVE 3900
+
 struct ath10k;
 
 struct ath10k_skb_cb {
@@ -61,6 +73,11 @@ struct ath10k_skb_cb {
 		u8 frag_len;
 		u8 pad_len;
 	} __packed htt;
+
+	struct {
+		bool dtim_zero;
+		bool deliver_cab;
+	} bcn;
 } __packed;
 
 static inline struct ath10k_skb_cb *ATH10K_SKB_CB(struct sk_buff *skb)
@@ -222,9 +239,16 @@ struct ath10k_vif {
 	u32 beacon_interval;
 	u32 dtim_period;
 	struct sk_buff *beacon;
+	/* protected by data_lock */
+	bool beacon_sent;
 
 	struct ath10k *ar;
 	struct ieee80211_vif *vif;
+
+	bool is_started;
+	bool is_up;
+	u32 aid;
+	u8 bssid[ETH_ALEN];
 
 	struct work_struct wep_key_work;
 	struct ieee80211_key_conf *wep_keys[WMI_MAX_KEY_INDEX + 1];
@@ -235,7 +259,6 @@ struct ath10k_vif {
 
 	union {
 		struct {
-			u8 bssid[ETH_ALEN];
 			u32 uapsd;
 		} sta;
 		struct {
@@ -249,9 +272,6 @@ struct ath10k_vif {
 			u32 noa_len;
 			u8 *noa_data;
 		} ap;
-		struct {
-			u8 bssid[ETH_ALEN];
-		} ibss;
 	} u;
 
 	u8 fixed_rate;
@@ -411,6 +431,9 @@ struct ath10k {
 
 	/* valid during scan; needed for mgmt rx during scan */
 	struct ieee80211_channel *scan_channel;
+
+	/* current operating channel definition */
+	struct cfg80211_chan_def chandef;
 
 	int free_vdev_map;
 	int monitor_vdev_id;
