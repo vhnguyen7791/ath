@@ -2071,11 +2071,11 @@ static int ath10k_wmi_ready_event_rx(struct ath10k *ar, struct sk_buff *skb)
 	memcpy(ar->mac_addr, ev->mac_addr.addr, ETH_ALEN);
 
 	ath10k_dbg(ATH10K_DBG_WMI,
-		   "wmi event ready sw_version %u abi_version %u mac_addr %pM status %d\n",
+		   "wmi event ready sw_version %u abi_version %u mac_addr %pM status %d skb->len %i ev-sz %zu\n",
 		   __le32_to_cpu(ev->sw_version),
 		   __le32_to_cpu(ev->abi_version),
 		   ev->mac_addr.addr,
-		   __le32_to_cpu(ev->status));
+		   __le32_to_cpu(ev->status), skb->len, sizeof(*ev));
 
 	complete(&ar->wmi.unified_ready);
 	return 0;
@@ -2443,7 +2443,7 @@ int ath10k_wmi_pdev_set_channel(struct ath10k *ar,
 				   ar->wmi.cmd->pdev_set_channel_cmdid);
 }
 
-int ath10k_wmi_pdev_suspend_target(struct ath10k *ar)
+int ath10k_wmi_pdev_suspend_target(struct ath10k *ar, u32 suspend_opt)
 {
 	struct wmi_pdev_suspend_cmd *cmd;
 	struct sk_buff *skb;
@@ -2453,7 +2453,7 @@ int ath10k_wmi_pdev_suspend_target(struct ath10k *ar)
 		return -ENOMEM;
 
 	cmd = (struct wmi_pdev_suspend_cmd *)skb->data;
-	cmd->suspend_opt = WMI_PDEV_SUSPEND;
+	cmd->suspend_opt = __cpu_to_le32(suspend_opt);
 
 	return ath10k_wmi_cmd_send(ar, skb, ar->wmi.cmd->pdev_suspend_cmdid);
 }
