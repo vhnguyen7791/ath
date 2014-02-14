@@ -1648,9 +1648,9 @@ static void ath10k_regd_update(struct ath10k *ar)
 	/* Target allows setting up per-band regdomain but ath_common provides
 	 * a combined one only */
 	ret = ath10k_wmi_pdev_set_regdomain(ar,
-					    regpair->regDmnEnum,
-					    regpair->regDmnEnum, /* 2ghz */
-					    regpair->regDmnEnum, /* 5ghz */
+					    regpair->reg_domain,
+					    regpair->reg_domain, /* 2ghz */
+					    regpair->reg_domain, /* 5ghz */
 					    regpair->reg_2ghz_ctl,
 					    regpair->reg_5ghz_ctl);
 	if (ret)
@@ -2785,7 +2785,7 @@ static void ath10k_bss_info_changed(struct ieee80211_hw *hw,
 				if (ret) {
 					ath10k_warn("failed to start vdev: %d\n",
 						    ret);
-					return;
+					goto exit;
 				}
 
 				arvif->is_started = true;
@@ -2866,6 +2866,7 @@ static void ath10k_bss_info_changed(struct ieee80211_hw *hw,
 			ath10k_bss_assoc(hw, vif, info);
 	}
 
+exit:
 	mutex_unlock(&ar->conf_mutex);
 }
 
