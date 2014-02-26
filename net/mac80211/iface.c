@@ -101,9 +101,8 @@ static u32 __ieee80211_idle_on(struct ieee80211_local *local)
 static u32 __ieee80211_recalc_idle(struct ieee80211_local *local,
 				   bool force_active)
 {
-	bool working = false, scanning, active;
+	bool working, scanning, active;
 	unsigned int led_trig_start = 0, led_trig_stop = 0;
-	struct ieee80211_roc_work *roc;
 
 	lockdep_assert_held(&local->mtx);
 
@@ -111,12 +110,8 @@ static u32 __ieee80211_recalc_idle(struct ieee80211_local *local,
 		 !list_empty(&local->chanctx_list) ||
 		 local->monitors;
 
-	if (!local->ops->remain_on_channel) {
-		list_for_each_entry(roc, &local->roc_list, list) {
-			working = true;
-			break;
-		}
-	}
+	working = !local->ops->remain_on_channel &&
+		  !list_empty(&local->roc_list);
 
 	scanning = test_bit(SCAN_SW_SCANNING, &local->scanning) ||
 		   test_bit(SCAN_ONCHANNEL_SCANNING, &local->scanning);
@@ -1059,7 +1054,8 @@ static void ieee80211_uninit(struct net_device *dev)
 
 static u16 ieee80211_netdev_select_queue(struct net_device *dev,
 					 struct sk_buff *skb,
-					 void *accel_priv)
+					 void *accel_priv,
+					 select_queue_fallback_t fallback)
 {
 	return ieee80211_select_queue(IEEE80211_DEV_TO_SUB_IF(dev), skb);
 }
@@ -1077,7 +1073,8 @@ static const struct net_device_ops ieee80211_dataif_ops = {
 
 static u16 ieee80211_monitor_select_queue(struct net_device *dev,
 					  struct sk_buff *skb,
-					  void *accel_priv)
+					  void *accel_priv,
+					  select_queue_fallback_t fallback)
 {
 	struct ieee80211_sub_if_data *sdata = IEEE80211_DEV_TO_SUB_IF(dev);
 	struct ieee80211_local *local = sdata->local;
