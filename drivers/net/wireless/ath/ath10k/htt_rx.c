@@ -43,7 +43,7 @@
 
 
 static int ath10k_htt_rx_get_csum_state(struct sk_buff *skb);
-
+static void ath10k_htt_txrx_compl_task(unsigned long ptr);
 
 static int ath10k_htt_rx_ring_size(struct ath10k_htt *htt)
 {
@@ -225,18 +225,16 @@ static void ath10k_htt_rx_ring_refill_retry(unsigned long arg)
 	ath10k_htt_rx_msdu_buff_replenish(htt);
 }
 
-static unsigned ath10k_htt_rx_ring_elems(struct ath10k_htt *htt)
-{
-	return (__le32_to_cpu(*htt->rx_ring.alloc_idx.vaddr) -
-		htt->rx_ring.sw_rd_idx.msdu_payld) & htt->rx_ring.size_mask;
-}
-
 void ath10k_htt_rx_detach(struct ath10k_htt *htt)
 {
 	int sw_rd_idx = htt->rx_ring.sw_rd_idx.msdu_payld;
 
 	del_timer_sync(&htt->rx_ring.refill_retry_timer);
 	tasklet_kill(&htt->rx_replenish_task);
+	tasklet_kill(&htt->txrx_compl_task);
+
+	skb_queue_purge(&htt->tx_compl_q);
+	skb_queue_purge(&htt->rx_compl_q);
 
 	while (sw_rd_idx != __le32_to_cpu(*(htt->rx_ring.alloc_idx.vaddr))) {
 		struct sk_buff *skb =
@@ -270,10 +268,12 @@ static inline struct sk_buff *ath10k_htt_rx_netbuf_pop(struct ath10k_htt *htt)
 	int idx;
 	struct sk_buff *msdu;
 
-	spin_lock_bh(&htt->rx_ring.lock);
+	lockdep_assert_held(&htt->rx_ring.lock);
 
-	if (ath10k_htt_rx_ring_elems(htt) == 0)
-		ath10k_warn("htt rx ring is empty!\n");
+	if (htt->rx_ring.fill_cnt == 0) {
+		ath10k_warn("tried to pop sk_buff from an empty rx ring\n");
+		return NULL;
+	}
 
 	idx = htt->rx_ring.sw_rd_idx.msdu_payld;
 	msdu = htt->rx_ring.netbufs_ring[idx];
@@ -283,7 +283,6 @@ static inline struct sk_buff *ath10k_htt_rx_netbuf_pop(struct ath10k_htt *htt)
 	htt->rx_ring.sw_rd_idx.msdu_payld = idx;
 	htt->rx_ring.fill_cnt--;
 
-	spin_unlock_bh(&htt->rx_ring.lock);
 	return msdu;
 }
 
@@ -307,8 +306,7 @@ static int ath10k_htt_rx_amsdu_pop(struct ath10k_htt *htt,
 	struct sk_buff *msdu;
 	struct htt_rx_desc *rx_desc;
 
-	if (ath10k_htt_rx_ring_elems(htt) == 0)
-		ath10k_warn("htt rx ring is empty!\n");
+	lockdep_assert_held(&htt->rx_ring.lock);
 
 	if (htt->rx_confused) {
 		ath10k_warn("htt is confused. refusing rx\n");
@@ -527,6 +525,12 @@ int ath10k_htt_rx_attach(struct ath10k_htt *htt)
 		goto err_fill_ring;
 
 	tasklet_init(&htt->rx_replenish_task, ath10k_htt_rx_replenish_task,
+		     (unsigned long)htt);
+
+	skb_queue_head_init(&htt->tx_compl_q);
+	skb_queue_head_init(&htt->rx_compl_q);
+
+	tasklet_init(&htt->txrx_compl_task, ath10k_htt_txrx_compl_task,
 		     (unsigned long)htt);
 
 	ath10k_dbg(ATH10K_DBG_BOOT, "htt rx ring size %d fill_level %d\n",
@@ -908,6 +912,8 @@ static void ath10k_htt_rx_handler(struct ath10k_htt *htt,
 	u8 *fw_desc;
 	int i, j;
 
+	lockdep_assert_held(&htt->rx_ring.lock);
+
 	memset(&info, 0, sizeof(info));
 
 	fw_desc_len = __le16_to_cpu(rx->prefix.fw_rx_desc_bytes);
@@ -1045,8 +1051,11 @@ static void ath10k_htt_rx_frag_handler(struct ath10k_htt *htt,
 
 	msdu_head = NULL;
 	msdu_tail = NULL;
+
+	spin_lock_bh(&htt->rx_ring.lock);
 	msdu_chaining = ath10k_htt_rx_amsdu_pop(htt, &fw_desc, &fw_desc_len,
 						&msdu_head, &msdu_tail);
+	spin_unlock_bh(&htt->rx_ring.lock);
 
 	ath10k_dbg(ATH10K_DBG_HTT_DUMP, "htt rx frag ahead\n");
 
@@ -1138,6 +1147,45 @@ end:
 	}
 }
 
+static void ath10k_htt_rx_frm_tx_compl(struct ath10k *ar,
+				       struct sk_buff *skb)
+{
+	struct ath10k_htt *htt = &ar->htt;
+	struct htt_resp *resp = (struct htt_resp *)skb->data;
+	struct htt_tx_done tx_done = {};
+	int status = MS(resp->data_tx_completion.flags, HTT_DATA_TX_STATUS);
+	__le16 msdu_id;
+	int i;
+
+	lockdep_assert_held(&htt->tx_lock);
+
+	switch (status) {
+	case HTT_DATA_TX_STATUS_NO_ACK:
+		tx_done.no_ack = true;
+		break;
+	case HTT_DATA_TX_STATUS_OK:
+		break;
+	case HTT_DATA_TX_STATUS_DISCARD:
+	case HTT_DATA_TX_STATUS_POSTPONE:
+	case HTT_DATA_TX_STATUS_DOWNLOAD_FAIL:
+		tx_done.discard = true;
+		break;
+	default:
+		ath10k_warn("unhandled tx completion status %d\n", status);
+		tx_done.discard = true;
+		break;
+	}
+
+	ath10k_dbg(ATH10K_DBG_HTT, "htt tx completion num_msdus %d\n",
+		   resp->data_tx_completion.num_msdus);
+
+	for (i = 0; i < resp->data_tx_completion.num_msdus; i++) {
+		msdu_id = resp->data_tx_completion.msdus[i];
+		tx_done.msdu_id = __le16_to_cpu(msdu_id);
+		ath10k_txrx_tx_unref(htt, &tx_done);
+	}
+}
+
 void ath10k_htt_t2h_msg_handler(struct ath10k *ar, struct sk_buff *skb)
 {
 	struct ath10k_htt *htt = &ar->htt;
@@ -1156,10 +1204,12 @@ void ath10k_htt_t2h_msg_handler(struct ath10k *ar, struct sk_buff *skb)
 		complete(&htt->target_version_received);
 		break;
 	}
-	case HTT_T2H_MSG_TYPE_RX_IND: {
-		ath10k_htt_rx_handler(htt, &resp->rx_ind);
-		break;
-	}
+	case HTT_T2H_MSG_TYPE_RX_IND:
+		spin_lock_bh(&htt->rx_ring.lock);
+		__skb_queue_tail(&htt->rx_compl_q, skb);
+		spin_unlock_bh(&htt->rx_ring.lock);
+		tasklet_schedule(&htt->txrx_compl_task);
+		return;
 	case HTT_T2H_MSG_TYPE_PEER_MAP: {
 		struct htt_peer_map_event ev = {
 			.vdev_id = resp->peer_map.vdev_id,
@@ -1194,44 +1244,17 @@ void ath10k_htt_t2h_msg_handler(struct ath10k *ar, struct sk_buff *skb)
 			break;
 		}
 
+		spin_lock_bh(&htt->tx_lock);
 		ath10k_txrx_tx_unref(htt, &tx_done);
+		spin_unlock_bh(&htt->tx_lock);
 		break;
 	}
-	case HTT_T2H_MSG_TYPE_TX_COMPL_IND: {
-		struct htt_tx_done tx_done = {};
-		int status = MS(resp->data_tx_completion.flags,
-				HTT_DATA_TX_STATUS);
-		__le16 msdu_id;
-		int i;
-
-		switch (status) {
-		case HTT_DATA_TX_STATUS_NO_ACK:
-			tx_done.no_ack = true;
-			break;
-		case HTT_DATA_TX_STATUS_OK:
-			break;
-		case HTT_DATA_TX_STATUS_DISCARD:
-		case HTT_DATA_TX_STATUS_POSTPONE:
-		case HTT_DATA_TX_STATUS_DOWNLOAD_FAIL:
-			tx_done.discard = true;
-			break;
-		default:
-			ath10k_warn("unhandled tx completion status %d\n",
-				    status);
-			tx_done.discard = true;
-			break;
-		}
-
-		ath10k_dbg(ATH10K_DBG_HTT, "htt tx completion num_msdus %d\n",
-			   resp->data_tx_completion.num_msdus);
-
-		for (i = 0; i < resp->data_tx_completion.num_msdus; i++) {
-			msdu_id = resp->data_tx_completion.msdus[i];
-			tx_done.msdu_id = __le16_to_cpu(msdu_id);
-			ath10k_txrx_tx_unref(htt, &tx_done);
-		}
-		break;
-	}
+	case HTT_T2H_MSG_TYPE_TX_COMPL_IND:
+		spin_lock_bh(&htt->tx_lock);
+		__skb_queue_tail(&htt->tx_compl_q, skb);
+		spin_unlock_bh(&htt->tx_lock);
+		tasklet_schedule(&htt->txrx_compl_task);
+		return;
 	case HTT_T2H_MSG_TYPE_SEC_IND: {
 		struct ath10k *ar = htt->ar;
 		struct htt_security_indication *ev = &resp->security_indication;
@@ -1270,4 +1293,26 @@ void ath10k_htt_t2h_msg_handler(struct ath10k *ar, struct sk_buff *skb)
 
 	/* Free the indication buffer */
 	dev_kfree_skb_any(skb);
+}
+
+static void ath10k_htt_txrx_compl_task(unsigned long ptr)
+{
+	struct ath10k_htt *htt = (struct ath10k_htt *)ptr;
+	struct htt_resp *resp;
+	struct sk_buff *skb;
+
+	spin_lock_bh(&htt->tx_lock);
+	while ((skb = __skb_dequeue(&htt->tx_compl_q))) {
+		ath10k_htt_rx_frm_tx_compl(htt->ar, skb);
+		dev_kfree_skb_any(skb);
+	}
+	spin_unlock_bh(&htt->tx_lock);
+
+	spin_lock_bh(&htt->rx_ring.lock);
+	while ((skb = __skb_dequeue(&htt->rx_compl_q))) {
+		resp = (struct htt_resp *)skb->data;
+		ath10k_htt_rx_handler(htt, &resp->rx_ind);
+		dev_kfree_skb_any(skb);
+	}
+	spin_unlock_bh(&htt->rx_ring.lock);
 }
