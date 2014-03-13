@@ -451,12 +451,23 @@ static ssize_t ath10k_read_simulate_fw_crash(struct file *file,
 					     char __user *user_buf,
 					     size_t count, loff_t *ppos)
 {
-	const char buf[] = "To simulate firmware crash write the keyword"
-			   " `crash` to this file.\nThis will force firmware"
-			   " to report a crash to the host system.\n";
+	const char buf[] = "To simulate firmware crash write one of the"
+			   " keywords to this file:\n `soft` - this will send"
+			   " WMI_FORCE_FW_HANG_ASSERT to firmware if FW"
+			   " supports that command.\n `hard` - this will send"
+			   " to firmware command with illegal parameters"
+			   " causing firmware crash.\n";
+
 	return simple_read_from_buffer(user_buf, count, ppos, buf, strlen(buf));
 }
 
+/* Simulate firmware crash:
+ * 'soft': Call wmi command causing firmware hang. This firmware hang is
+ * recoverable by warm firmware reset.
+ * 'hard': Force firmware crash by setting any vdev parameter for not allowed
+ * vdev id. This is hard firmware crash because it is recoverable only by cold
+ * firmware reset.
+ */
 static ssize_t ath10k_write_simulate_fw_crash(struct file *file,
 					      const char __user *user_buf,
 					      size_t count, loff_t *ppos)
@@ -467,11 +478,9 @@ static ssize_t ath10k_write_simulate_fw_crash(struct file *file,
 
 	mutex_lock(&ar->conf_mutex);
 
+	/* Don't copy over the last byte, keep it initialised to zero to
+	 * make sure that the buffer is properly null terminated. */
 	simple_write_to_buffer(buf, sizeof(buf) - 1, ppos, user_buf, count);
-	if (strcmp(buf, "crash") && strcmp(buf, "crash\n")) {
-		ret = -EINVAL;
-		goto exit;
-	}
 
 	if (ar->state != ATH10K_STATE_ON &&
 	    ar->state != ATH10K_STATE_RESTARTED) {
@@ -479,14 +488,30 @@ static ssize_t ath10k_write_simulate_fw_crash(struct file *file,
 		goto exit;
 	}
 
-	ath10k_info("simulating firmware crash\n");
+	/* drop the possible '\n' from the end */
+	if (buf[count - 1] == '\n') {
+		buf[count - 1] = 0;
+		count--;
+	}
 
-	ret = ath10k_wmi_force_fw_hang(ar, WMI_FORCE_FW_HANG_ASSERT, 0);
-	if (ret)
-		ath10k_warn("failed to force fw hang (%d)\n", ret);
+	if (!strncmp(buf, "soft", sizeof(buf))) {
+		ath10k_info("simulating soft firmware crash\n");
+		ret = ath10k_wmi_force_fw_hang(ar, WMI_FORCE_FW_HANG_ASSERT, 0);
+	} else if (!strncmp(buf, "hard", sizeof(buf))) {
+		ath10k_info("simulating hard firmware crash\n");
+		ret = ath10k_wmi_vdev_set_param(ar, TARGET_NUM_VDEVS + 1,
+					ar->wmi.vdev_param->rts_threshold, 0);
+	} else {
+		ret = -EINVAL;
+		goto exit;
+	}
 
-	if (ret == 0)
-		ret = count;
+	if (ret) {
+		ath10k_warn("failed to simulate firmware crash: %d\n", ret);
+		goto exit;
+	}
+
+	ret = count;
 
 exit:
 	mutex_unlock(&ar->conf_mutex);
