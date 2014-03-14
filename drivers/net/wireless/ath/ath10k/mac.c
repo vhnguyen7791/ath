@@ -1730,6 +1730,8 @@ static void ath10k_regd_update(struct ath10k *ar)
 {
 	struct reg_dmn_pair_mapping *regpair;
 	int ret;
+	enum wmi_dfs_region wmi_dfs_reg = WMI_UNINIT_DFS_DOMAIN;
+	enum nl80211_dfs_regions nl_dfs_reg;
 
 	lockdep_assert_held(&ar->conf_mutex);
 
@@ -1739,6 +1741,11 @@ static void ath10k_regd_update(struct ath10k *ar)
 
 	regpair = ar->ath_common.regulatory.regpair;
 
+	if (config_enabled(CONFIG_ATH10K_DFS_CERTIFIED) && ar->dfs_detector) {
+		nl_dfs_reg = ar->dfs_detector->region;
+		wmi_dfs_reg = ath10k_wmi_dfs_region_from_nl80211(nl_dfs_reg);
+	}
+
 	/* Target allows setting up per-band regdomain but ath_common provides
 	 * a combined one only */
 	ret = ath10k_wmi_pdev_set_regdomain(ar,
@@ -1746,7 +1753,8 @@ static void ath10k_regd_update(struct ath10k *ar)
 					    regpair->reg_domain, /* 2ghz */
 					    regpair->reg_domain, /* 5ghz */
 					    regpair->reg_2ghz_ctl,
-					    regpair->reg_5ghz_ctl);
+					    regpair->reg_5ghz_ctl,
+					    wmi_dfs_reg);
 	if (ret)
 		ath10k_warn("could not set pdev regdomain (%d)\n", ret);
 }
